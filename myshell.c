@@ -24,7 +24,6 @@ enum cmd_type { EXEC, PIPE, REDIR };
 struct cmd {
     enum cmd_type type;
     int fgbg;
-    char cmdline[MAXLEN];
 };
 
 /**
@@ -43,7 +42,6 @@ struct execcmd {
 struct pipecmd {
     enum cmd_type type;
     int fgbg;
-    char cmdline[MAXLEN];
     struct cmd *left;
     struct cmd *right;
 };
@@ -51,7 +49,6 @@ struct pipecmd {
 struct redircmd {
     enum cmd_type type;
     int fgbg;
-    char cmdline[MAXLEN];
     struct cmd *command;
     int mode;   // 追加或截断
     char in_file[FILELEN];
@@ -136,11 +133,10 @@ int main() {
 /**
  * create_pipecmd - 创建一个 pipecmd 对象
  */
-struct cmd *create_pipecmd(char *buf, struct cmd *left, struct cmd *right) {
+struct cmd *create_pipecmd(struct cmd *left, struct cmd *right) {
     struct pipecmd *pipe_cmd = (struct pipecmd *)malloc(sizeof(struct pipecmd));
     pipe_cmd->type = PIPE;
     pipe_cmd->fgbg = 0;
-    strcpy(pipe_cmd->cmdline, buf);
     pipe_cmd->type = PIPE;
     pipe_cmd->left = left;
     pipe_cmd->right = right;
@@ -161,11 +157,10 @@ struct cmd *create_execcmd(char *buf) {
 /**
  * create_redircmd - 创建一个 redircmd 对象
  */
-struct cmd *create_redircmd(char *buf, struct cmd *inner_command, int mode, char *in_file, char *out_file) {
+struct cmd *create_redircmd(struct cmd *inner_command, int mode, char *in_file, char *out_file) {
     struct redircmd *redir_cmd = (struct redircmd *)malloc(sizeof(struct redircmd));
     redir_cmd->type = REDIR;
     redir_cmd->fgbg = 0;
-    strcpy(redir_cmd->cmdline, buf);
     redir_cmd->command = inner_command;
     redir_cmd->mode = mode;
     strcpy(redir_cmd->in_file, in_file);
@@ -222,7 +217,7 @@ struct cmd *parseredir(char *buf, struct cmd *inner_command) {
     }
 
     if (*in_file || *out_file) {    // 存在重定向
-        command = create_redircmd(buf, inner_command, mode, in_file, out_file);
+        command = create_redircmd(inner_command, mode, in_file, out_file);
     }
 
     return command;
@@ -240,7 +235,7 @@ struct cmd *parseexec(char *buf) {
     struct cmd *command = create_execcmd(buf);
     struct execcmd *ret = (struct execcmd *)command;
     command = parseredir(buf, command);
-    char *array = command->cmdline; // 指向结构体内部的命令
+    char *array = ret->cmdline; // 指向结构体内部的命令
     while (i < len) {
         // 找到下一个非空字符，作为下一个参数的开始位置
         while (array[begin] == ' ' || array[begin] == '\0') {
@@ -287,7 +282,7 @@ struct cmd *parsepipe(char *buf) {
         *pos = '\0';
         char *next = next_nonempty(pos + 1);
         command = parseexec(buf);
-        command = create_pipecmd(buf, command, parsecmd(next));
+        command = create_pipecmd(command, parsecmd(next));
     } else {
         command = parseexec(buf);
     }
