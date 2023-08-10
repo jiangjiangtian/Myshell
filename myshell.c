@@ -61,6 +61,15 @@ struct redircmd {
     char out_file[FILELEN];
 };
 
+/* 
+ * Jobs states: FG (foreground), BG (background), ST (stopped)
+ * Job state transitions and enabling actions:
+ *     FG -> ST  : ctrl-z
+ *     ST -> FG  : fg command
+ *     ST -> BG  : bg command
+ *     BG -> FG  : fg command
+ * 最多一个工作能在 FG 状态
+ */
 /**
  * 工作的状态
  */
@@ -73,11 +82,11 @@ struct job_t {
     int jid;
     pid_t pid;
     enum job_state state;
-    struct cmd command;
+    struct cmd *command;
     char cmdline[MAXLEN];   // 由于在解析中，我们会修改原始的命令，所以我们需要另一个字符数组
 } jobs[MAXJOBS];
 
-int nextjid = 0;
+int nextjid = 1;    // 下一个要分配的 job id
 
 char pwd[MAXLEN];   // 表示当前工作目录
 /**
@@ -118,6 +127,7 @@ struct cmd *parsecmd(char *cmd);
 void eval(struct cmd *command);
 int is_built_in_command(int argc, char *argv[]);
 void test_parse(struct cmd *command);
+void initjob();
 
 int main() {
     static char cmd[MAXLEN];
@@ -128,6 +138,7 @@ int main() {
     setenv("SHELL", pwd, 1);
     mode = umask(0);  // 获得默认的设置
     umask(mode);      // 恢复默认设置
+    initjob();
     while (1) {
         print_prompt();
         readcmd(cmd);
@@ -176,6 +187,31 @@ struct cmd *create_redircmd(struct cmd *inner_command, int mode, char *in_file, 
     return (struct cmd *)redir_cmd;
 }
 
+/**
+ * free_cmd - 释放 struct cmd 的资源
+ */
+void free_cmd(struct cmd *command) {
+    struct execcmd *exec_cmd;
+    struct pipecmd *pipe_cmd;
+    struct redircmd *redir_cmd;
+    // 判断 command 的类型
+    switch (command->type) {
+        case EXEC:
+            free(command);
+            break;
+        case PIPE:
+            pipe_cmd = (struct pipecmd *)command;
+            free_cmd(pipe_cmd->left);   // 释放左子结点的资源
+            free_cmd(pipe_cmd->right);  // 释放右子结点的资源
+            free(command);
+            break;
+        case REDIR:
+            redir_cmd = (struct redircmd *)command;
+            free_cmd(redir_cmd->command);  // 释放内部命令的资源
+            free(command);
+            break;
+    }
+}
 /*
  * parsecmd - 解析输入的命令，将输入的命令按照空格
  * 进行分割，然后存储到 argv 数组中
@@ -322,7 +358,7 @@ void eval(struct cmd *command) {
             built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
             if (!built_in && (pid = fork()) == 0) {    // 不为内置命令
                 execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
-                fprintf(stderr, "execve error!\n");
+                fprintf(stderr, "%s: 未找到命令\n", "");
             } else if (pid != 0) {  // 等待子进程运行结束
                 wait(0);
             }
@@ -331,7 +367,7 @@ void eval(struct cmd *command) {
             pipe_cmd = (struct pipecmd *)command;
             if (fork() == 0) {
                 if (pipe(fds) == -1) {
-                    fprintf(stderr, "execve error: %s\n", strerror(errno));
+                    fprintf(stderr, "pipe error: %s\n", strerror(errno));
                 }
 
                 if (fork() == 0) {  //  right
@@ -376,7 +412,7 @@ void eval(struct cmd *command) {
                 built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
                 if (!built_in) {
                     execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
-                    fprintf(stderr, "execve error: %s\n", strerror(errno));
+                    fprintf(stderr, "%s: 未找到命令\n", "");
                 } else {
                     exit(0);
                 }
@@ -428,7 +464,8 @@ int is_built_in_command(int argc, char *argv[]) {
         set_imp();
         return 12;
     } else if (strcmp(argv[0], "test") == 0) {
-
+        test_imp(argc, argv);
+        return 13;
     } else if (strcmp(argv[0], "time") == 0) {
         time_imp();
         return 14;
@@ -484,5 +521,22 @@ void test_parse(struct cmd *command) {
             printf("in_file: %s\n", redir_cmd->in_file);
             printf("out_file: %s\n", redir_cmd->out_file);
             break;
+    }
+}
+
+void clearjob(struct job_t *job) {
+    *(job->cmdline) = '\0';
+    if (job->command) {
+        free_cmd(job->command);
+    }
+    job->command = NULL;
+    job->jid = 0;
+    job->pid = 0;
+    job->state = INVALID;
+}
+
+void initjob() {
+    for (int i = 0; i < MAXJOBS; i++) {
+        clearjob(&jobs[i]);
     }
 }
