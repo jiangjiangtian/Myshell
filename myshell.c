@@ -4,7 +4,9 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "built_in_command.h"
 
@@ -12,6 +14,9 @@
 #define MAXARGS 16
 #define MAXJOBS 32
 #define FILELEN 16
+#define MODE (S_IRUSR | S_IWUSR | S_IXUSR | S_IROTH | S_IWOTH | S_IXOTH | S_IRGRP | S_IWGRP | S_IXGRP)
+
+mode_t mode; // 创建文件时的权限
 
 /**
  * 三种命令状态，EXEC 为正常运行，PIPE 为管道，REDIR 为重定向
@@ -32,8 +37,9 @@ struct cmd {
 struct execcmd {
     enum cmd_type type;
     int fgbg;
-    char cmdline[MAXLEN];
+    int argc;
     char *argv[MAXARGS];
+    char cmdline[MAXLEN];
 };
 
 /**
@@ -109,22 +115,24 @@ struct cmd *parseredir(char *buf, struct cmd *inner_command);
 struct cmd *parseexec(char *buf);
 struct cmd *parsepipe(char *buf);
 struct cmd *parsecmd(char *cmd);
-void eval(char *buf);
+void eval(struct cmd *command);
 int is_built_in_command(int argc, char *argv[]);
 void test_parse(struct cmd *command);
 
 int main() {
-    char cmd[MAXLEN];
+    static char cmd[MAXLEN];
     // 通过 getenv 函数获得 PWD 环境变量
     // PWD 的值为启动时的工作目录
     strcpy(pwd, getenv("PWD"));
     // 设置 shell 环境变量
     setenv("SHELL", pwd, 1);
+    mode = umask(0);  // 获得默认的设置
+    umask(mode);      // 恢复默认设置
     while (1) {
         print_prompt();
         readcmd(cmd);
         struct cmd *command = parsecmd(cmd);
-        test_parse(command);
+        eval(command);
     }
 
     return 0;
@@ -267,6 +275,7 @@ struct cmd *parseexec(char *buf) {
         ret->fgbg = 1;
     }
     ret->argv[argc] = NULL;
+    ret->argc = argc;
     return command;
 }
 
@@ -289,25 +298,93 @@ struct cmd *parsepipe(char *buf) {
     return command;
 }
 
-void eval(char *buf) {
-    // 空行，直接退出
-    if (*buf == '\0') {
-        return;
+/**
+ * eval - 根据传入的 command 的类型选择运行的方式
+ */
+void eval(struct cmd *command) {
+    struct execcmd *exec_cmd;
+    struct pipecmd *pipe_cmd;
+    struct redircmd *redir_cmd;
+    int built_in;
+    int fd;
+    int fds[2];
+    pid_t pid = 0;
+
+    if (command->fgbg) {
+        if (fork() == 0) {
+            eval(command);
+        }
     }
 
-    char *argv[MAXARGS];
-    int argc = 0;
-    parsecmd(buf);
+    switch (command->type) {
+        case EXEC:  // 直接运行
+            exec_cmd = (struct execcmd *)command;
+            built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
+            if (!built_in && (pid = fork()) == 0) {    // 不为内置命令
+                execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
+                fprintf(stderr, "execve error!\n");
+            } else if (pid != 0) {  // 等待子进程运行结束
+                wait(0);
+            }
+            break;
+        case PIPE:  // 管道
+            pipe_cmd = (struct pipecmd *)command;
+            if (fork() == 0) {
+                if (pipe(fds) == -1) {
+                    fprintf(stderr, "execve error: %s\n", strerror(errno));
+                }
 
-    // 输入的为空命令，直接退出
-    if (argc == 0) {
-        return;
-    }
-    
-    int built_in = is_built_in_command(argc, argv);
-    
-    if (!built_in) {
+                if (fork() == 0) {  //  right
+                    close(0);
+                    dup(fds[0]);
+                    close(fds[0]);
+                    close(fds[1]);
+                    eval(pipe_cmd->right);
+                }
 
+                if (fork() == 0) {    //  left
+                    close(1);
+                    dup(fds[1]);
+                    close(fds[1]);
+                    close(fds[0]);
+                    close(fds[1]);
+                    eval(pipe_cmd->left);
+                }
+                close(fds[0]);
+                close(fds[1]);
+                // 等待两个子进程完成运行
+                wait(0);
+                wait(0);
+            }
+            break;
+        case REDIR:
+            redir_cmd = (struct redircmd *)command;
+            if (fork() == 0) {
+                if (*redir_cmd->in_file) {  // 重定向标准输入
+                    close(0);
+                    if ((fd = open(redir_cmd->in_file, O_RDONLY)) != 0) {
+                        fprintf(stderr, "open error: %s\n", strerror(errno));
+                    }
+                }
+                if (*redir_cmd->out_file) { // 重定向标准输出
+                    close(1);                   
+                    if ((fd = open(redir_cmd->out_file, redir_cmd->mode, MODE ^ mode)) != 1) {
+                        fprintf(stderr, "open error: %s\n", strerror(errno));
+                    }
+                }
+                exec_cmd = (struct execcmd *)redir_cmd->command;
+                built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
+                if (!built_in) {
+                    execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
+                    fprintf(stderr, "execve error: %s\n", strerror(errno));
+                } else {
+                    exit(0);
+                }
+            }
+            wait(0);
+            break;
+        default:
+            fprintf(stderr, "unknown command type\n");
     }
 }
 
@@ -356,7 +433,8 @@ int is_built_in_command(int argc, char *argv[]) {
         time_imp();
         return 14;
     } else if (strcmp(argv[0], "umask") == 0) {
-
+        umask_imp(argv);
+        return 15;
     }
     return 0;
 }
