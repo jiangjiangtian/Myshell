@@ -11,6 +11,7 @@
 #include "built_in_command.h"
 #define MAXLEN 512
 extern char pwd[MAXLEN];
+extern mode_t mode;
 
 /**
  * cd_imp - cd 命令的实现，更改环境变量 PWD
@@ -133,4 +134,28 @@ void set_imp(void) {
     for (int i = 0; str != NULL; i++, str = __environ[i]) {
         printf("%s\n", str);
     }
+}
+
+/**
+ * umask_imp - 设置创建文件时的权限，如果没有参数，则输出当前的设置
+ */
+void umask_imp(char *argv[]) {
+    if (argv[1] == NULL) {  // 没有参数，输出当前的设置
+        printf("%u\n", mode);
+    }
+    // 判断传入参数是否合法
+    int len = strlen(argv[1]);
+    if (len > 4) {
+        fprintf(stderr, "参数太长：最多三位\n");
+        return;
+    }
+    for (int i = len - 1; i >= 0; i--) {
+        if (argv[1][i] < '0' && argv[1][i] > '7') {
+            fprintf(stderr, "参数不合法，每一位只能为 0 到 7\n");
+            return;
+        }
+    }
+    // 设置
+    mode = atoi(argv[1]);
+    umask(mode);
 }
