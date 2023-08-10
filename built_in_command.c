@@ -159,3 +159,65 @@ void umask_imp(char *argv[]) {
     mode = atoi(argv[1]);
     umask(mode);
 }
+
+/**
+ * is_valid_integer - 判断字符串 str 是否是合法的整数字符串
+ */
+int is_valid_integer(char *str) {
+    while (*str) {
+        if (*str < '0' || *str > '9') {
+            return 0;
+        }
+        str++;
+    }
+    return 1;
+}
+/**
+ * test_imp - test 的实现，只实现关于整数的比较
+ * -gt : 大于 -ge : 大于等于
+ * -lt : 小于 -le : 小于等于
+ * -eq : 等于 -ne : 不等于
+ */
+void test_imp(int argc, char *argv[]) {
+    if (argc > 4) {
+        fprintf(stderr, "test: 参数太多\n");
+        return;
+    } else if (argc < 4) {
+        fprintf(stderr, "test: 只支持二元表达式\n");
+        return;
+    }
+
+    if (!is_valid_integer(argv[1])) {
+        fprintf(stderr, "%s: 需要整数表达式\n", argv[1]);
+        return;
+    }
+
+    if (!is_valid_integer(argv[3])) {
+        fprintf(stderr, "%s: 需要整数表达式\n", argv[3]);
+        return;
+    }
+
+    char op;
+    int operand1 = atoi(argv[1]);
+    int operand2 = atoi(argv[3]);
+    int ret;
+    
+    if (strcmp(argv[2], "-gt") == 0) {
+        ret = operand1 > operand2;
+    } else if (strcmp(argv[2], "-ge") == 0) {
+        ret = operand1 >= operand2;
+    } else if (strcmp(argv[2], "-lt") == 0) {
+        ret = operand1 < operand2;
+    } else if (strcmp(argv[2], "-le") == 0) {
+        ret = operand1 <= operand2;
+    } else if (strcmp(argv[2], "-eq") == 0) {
+        ret = operand1 == operand2;
+    } else if (strcmp(argv[2], "-ne") == 0) {
+        ret = operand1 != operand2;
+    } else {
+        fprintf(stderr, "%s: 未知操作符\n", argv[2]);
+        return;
+    }
+
+    printf("%s\n", ret ? "true" : "false");
+}

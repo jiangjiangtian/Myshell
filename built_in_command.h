@@ -10,5 +10,6 @@ void time_imp();
 void help_imp(void);
 void set_imp(void);
 void umask_imp(char *argv[]);
+void test_imp(int argc, char *argv[]);
 
 #endif
