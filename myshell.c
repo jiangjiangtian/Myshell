@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -68,15 +70,15 @@ struct redircmd {
  *     ST -> FG  : fg command
  *     ST -> BG  : bg command
  *     BG -> FG  : fg command
- * 最多一个工作能在 FG 状态
+ * 最多一个作业能在 FG 状态
  */
 /**
- * 工作的状态
+ * 作业的状态
  */
 enum job_state { INVALID, BG, FG, ST };
 
 /**
- * 表示工作的结构体
+ * 表示作业的结构体
  */
 struct job_t {
     int jid;
@@ -88,7 +90,22 @@ struct job_t {
 
 int nextjid = 1;    // 下一个要分配的 job id
 
-char pwd[MAXLEN];   // 表示当前工作目录
+char pwd[MAXLEN];   // 表示当前作业目录
+
+struct cmd *parseredir(char *buf, struct cmd *inner_command);
+struct cmd *parseexec(char *buf);
+struct cmd *parsepipe(char *buf);
+struct cmd *parsecmd(char *cmd);
+void eval(char *cmdline, struct cmd *command);
+int is_built_in_command(int argc, char *argv[]);
+void test_parse(struct cmd *command);
+void initjob();
+struct job_t *addjob(char *cmdline, int bgfg, struct cmd *command, pid_t pid);
+void listjobs();
+void sigchld_handler(int sig);
+typedef void handler_t(int);
+handler_t *Signal(int signum, handler_t *handler);
+
 /**
  * print_prompt - 输出提示符
  */
@@ -120,30 +137,48 @@ char *next_nonempty(char *buf) {
     return buf;
 }
 
-struct cmd *parseredir(char *buf, struct cmd *inner_command);
-struct cmd *parseexec(char *buf);
-struct cmd *parsepipe(char *buf);
-struct cmd *parsecmd(char *cmd);
-void eval(struct cmd *command);
-int is_built_in_command(int argc, char *argv[]);
-void test_parse(struct cmd *command);
-void initjob();
-
 int main() {
-    static char cmd[MAXLEN];
+    static char cmdline[MAXLEN];
     // 通过 getenv 函数获得 PWD 环境变量
-    // PWD 的值为启动时的工作目录
+    // PWD 的值为启动时的作业目录
     strcpy(pwd, getenv("PWD"));
     // 设置 shell 环境变量
     setenv("SHELL", pwd, 1);
     mode = umask(0);  // 获得默认的设置
     umask(mode);      // 恢复默认设置
+    Signal(SIGCHLD, sigchld_handler);  // 设置子进程终止时调用的函数
     initjob();
+    pid_t pid;
+    sigset_t oldmask, mask;
     while (1) {
         print_prompt();
-        readcmd(cmd);
-        struct cmd *command = parsecmd(cmd);
-        eval(command);
+        readcmd(cmdline);
+        struct cmd *command = parsecmd(cmdline);
+        if (!command) { // 空命令
+            continue;
+        }
+        if (!command->fgbg && command->type == EXEC &&
+            is_built_in_command(((struct execcmd *)command)->argc, ((struct execcmd *)command)->argv) != 0) {
+                continue;   // 内部命令且为前台运行
+        }
+        // 阻塞 SIGCHLD 信号，防止子进程在父进程调用 addjob
+        // 之前就已经调用 deljob
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &mask, &oldmask);
+        if ((pid = fork()) == 0) {
+            sigprocmask(SIG_SETMASK, &oldmask, NULL);
+            eval(cmdline, command);
+        } else {
+            if (!command->fgbg) {
+                // 阻塞所有的信号，保护 jobs 数组
+                sigfillset(&mask);
+                sigprocmask(SIG_BLOCK, &mask, NULL);
+                addjob(cmdline, command->fgbg, command, pid);
+                sigprocmask(SIG_SETMASK, &oldmask, NULL);
+                wait(0);
+            }
+        }
     }
 
     return 0;
@@ -218,7 +253,13 @@ void free_cmd(struct cmd *command) {
  * 返回值：1——后台运行，0——前台运行
  */
 struct cmd *parsecmd(char *cmd) {
+    if (*cmd == 0) {    // 空命令，返回 NULL
+        return NULL;
+    }
     struct cmd *command = parsepipe(cmd);
+    if (strchr(cmd, '&') != NULL) { // 判断为前台运行还是后台运行
+        command->fgbg = 1;
+    }
     return command;
 }
 
@@ -301,14 +342,13 @@ struct cmd *parseexec(char *buf) {
             ++i;
         }
         array[i] = '\0';
+        if (strcmp(&array[begin], "&") == 0) {
+            // 我们只假设 & 为命令的最后一个参数，所以当我们遇到 & 时，
+            // 我们直接退出，尽管后面还可能有其他的参数
+            break;
+        }
         ret->argv[argc++] = &array[begin];
         begin = ++i;
-    }
-    // 判断为前台运行还是后台运行
-    if (strcmp(ret->argv[argc - 1], "&") == 0) {
-        --argc;
-        ret->argv[argc] = NULL;
-        ret->fgbg = 1;
     }
     ret->argv[argc] = NULL;
     ret->argc = argc;
@@ -328,6 +368,7 @@ struct cmd *parsepipe(char *buf) {
         char *next = next_nonempty(pos + 1);
         command = parseexec(buf);
         command = create_pipecmd(command, parsecmd(next));
+        *pos = '|';  // 为了能够输出整条命令，我们将之前清空的 | 恢复
     } else {
         command = parseexec(buf);
     }
@@ -337,7 +378,7 @@ struct cmd *parsepipe(char *buf) {
 /**
  * eval - 根据传入的 command 的类型选择运行的方式
  */
-void eval(struct cmd *command) {
+void eval(char *cmdline, struct cmd *command) {
     struct execcmd *exec_cmd;
     struct pipecmd *pipe_cmd;
     struct redircmd *redir_cmd;
@@ -346,9 +387,23 @@ void eval(struct cmd *command) {
     int fds[2];
     pid_t pid = 0;
 
-    if (command->fgbg) {
+    if (command->fgbg) {  // 后台运行，直接创建一个进程运行
+        sigset_t mask, oldmask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &mask, &oldmask);
         if (fork() == 0) {
-            eval(command);
+            sigprocmask(SIG_SETMASK, &oldmask, NULL);
+            command->fgbg = 0;
+            eval(cmdline, command);
+        } else {
+            // 阻塞所有的信号，保护 jobs 数组
+            sigfillset(&mask);
+            sigprocmask(SIG_BLOCK, &mask, NULL);
+            struct job_t *job = addjob(cmdline, command->fgbg, command, pid);
+            printf("[%d] (%d) %s\n", job->jid, job->pid, job->cmdline);
+            sigprocmask(SIG_SETMASK, &oldmask, NULL);
+            exit(0);
         }
     }
 
@@ -356,68 +411,65 @@ void eval(struct cmd *command) {
         case EXEC:  // 直接运行
             exec_cmd = (struct execcmd *)command;
             built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
-            if (!built_in && (pid = fork()) == 0) {    // 不为内置命令
+            if (!built_in) {    // 不为内置命令
                 execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
-                fprintf(stderr, "%s: 未找到命令\n", "");
-            } else if (pid != 0) {  // 等待子进程运行结束
-                wait(0);
+                fprintf(stderr, "%s: 未找到命令\n", cmdline);
+                exit(1);
+            } else {    // 内部命令，直接退出
+                exit(0);
             }
             break;
         case PIPE:  // 管道
             pipe_cmd = (struct pipecmd *)command;
-            if (fork() == 0) {
-                if (pipe(fds) == -1) {
-                    fprintf(stderr, "pipe error: %s\n", strerror(errno));
-                }
+            if (pipe(fds) == -1) {
+                fprintf(stderr, "pipe error: %s\n", strerror(errno));
+            }
 
-                if (fork() == 0) {  //  right
-                    close(0);
-                    dup(fds[0]);
-                    close(fds[0]);
-                    close(fds[1]);
-                    eval(pipe_cmd->right);
-                }
-
-                if (fork() == 0) {    //  left
-                    close(1);
-                    dup(fds[1]);
-                    close(fds[1]);
-                    close(fds[0]);
-                    close(fds[1]);
-                    eval(pipe_cmd->left);
-                }
+            if (fork() == 0) {  //  right
+                close(0);
+                dup(fds[0]);
                 close(fds[0]);
                 close(fds[1]);
-                // 等待两个子进程完成运行
-                wait(0);
-                wait(0);
+                eval(cmdline, pipe_cmd->right);
             }
+
+            if (fork() == 0) {    //  left
+                close(1);
+                dup(fds[1]);
+                close(fds[0]);
+                close(fds[1]);
+                eval(cmdline, pipe_cmd->left);
+            }
+            close(fds[0]);
+            close(fds[1]);
+            // 等待两个子进程完成运行
+            wait(0);
+            wait(0);
+            exit(0);
             break;
         case REDIR:
             redir_cmd = (struct redircmd *)command;
-            if (fork() == 0) {
-                if (*redir_cmd->in_file) {  // 重定向标准输入
-                    close(0);
-                    if ((fd = open(redir_cmd->in_file, O_RDONLY)) != 0) {
-                        fprintf(stderr, "open error: %s\n", strerror(errno));
-                    }
-                }
-                if (*redir_cmd->out_file) { // 重定向标准输出
-                    close(1);                   
-                    if ((fd = open(redir_cmd->out_file, redir_cmd->mode, MODE ^ mode)) != 1) {
-                        fprintf(stderr, "open error: %s\n", strerror(errno));
-                    }
-                }
-                exec_cmd = (struct execcmd *)redir_cmd->command;
-                built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
-                if (!built_in) {
-                    execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
-                    fprintf(stderr, "%s: 未找到命令\n", "");
-                } else {
-                    exit(0);
+            if (*redir_cmd->in_file) {  // 重定向标准输入
+                close(0);
+                if ((fd = open(redir_cmd->in_file, O_RDONLY)) != 0) {
+                    fprintf(stderr, "open error: %s\n", strerror(errno));
                 }
             }
-            wait(0);
+            if (*redir_cmd->out_file) { // 重定向标准输出
+                close(1);                   
+                if ((fd = open(redir_cmd->out_file, redir_cmd->mode, MODE ^ mode)) != 1) {
+                    fprintf(stderr, "open error: %s\n", strerror(errno));
+                }
+            }
+            exec_cmd = (struct execcmd *)redir_cmd->command;
+            built_in = is_built_in_command(exec_cmd->argc, exec_cmd->argv); // 判断是否是内部命令
+            if (!built_in) {
+                execve(exec_cmd->argv[0], exec_cmd->argv, __environ);
+                fprintf(stderr, "%s: 未找到命令\n", cmdline);
+                exit(1);
+            } else {
+                exit(0);
+            }
             break;
         default:
             fprintf(stderr, "unknown command type\n");
@@ -456,7 +508,8 @@ int is_built_in_command(int argc, char *argv[]) {
         help_imp();
         return 9;
     } else if (strcmp(argv[0], "jobs") == 0) {
-
+        listjobs();
+        return 10;
     } else if (strcmp(argv[0], "pwd") == 0) {
         printf("%s\n", pwd);
         return 11;
@@ -524,9 +577,12 @@ void test_parse(struct cmd *command) {
     }
 }
 
+/**
+ * clearjob - 清空 job_t 结构体
+ */
 void clearjob(struct job_t *job) {
     *(job->cmdline) = '\0';
-    if (job->command) {
+    if (job->command) {  // 释放 command 资源
         free_cmd(job->command);
     }
     job->command = NULL;
@@ -535,8 +591,118 @@ void clearjob(struct job_t *job) {
     job->state = INVALID;
 }
 
+/**
+ * initjob - 初始化 job_t 数组
+ */
 void initjob() {
     for (int i = 0; i < MAXJOBS; i++) {
         clearjob(&jobs[i]);
     }
+}
+
+/**
+ * addjob - 向 job_t 数组中添加一个 job，返回刚设置的结构体
+ */
+struct job_t *addjob(char *cmdline, int bgfg, struct cmd *command, pid_t pid) {
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].state == INVALID) {
+            jobs[i].state = bgfg ? BG : FG;
+            jobs[i].pid = pid;
+            jobs[i].command = command;
+            strcpy(jobs[i].cmdline, cmdline);
+            jobs[i].jid = nextjid++;
+            if (nextjid == MAXJOBS) {
+                nextjid = 1;
+            }
+            return &jobs[i];
+        }
+    }
+    fprintf(stderr, "作业数量过多\n");
+    return NULL;
+}
+
+/**
+ * maxjid - 返回当前最大的 jid
+ */
+int maxjid() {
+    int jid = 0;
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].state != INVALID && jobs[i].jid > jid) {
+            jid = jobs[i].jid;
+        }
+    }
+    return jid;
+}
+
+/**
+ * deljob - 删除 jobs 数组中 pid 等于传入的 pid 的结构体
+ */
+int deljob(pid_t pid) {
+    if (pid < 0) {
+        return 0;
+    }
+
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pid == pid) {
+            clearjob(&jobs[i]);
+            nextjid = maxjid() + 1;  // 设置下一个 jid
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * listjobs - 列出 jobs 数组中所有状态不为 INVALID 的结构体
+ */
+void listjobs() {
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].state != INVALID) {
+            printf("[%d] (%d) ", jobs[i].jid, jobs[i].pid);
+            switch (jobs[i].state) {
+                case BG: 
+                    printf("Running ");
+                    break;
+                case FG: 
+                    printf("Foreground ");
+                    break;
+                case ST: 
+                    printf("Stopped ");
+                    break;
+                default:
+                    printf("listjobs: Internal error: job[%d].state=%d ", 
+                    i, jobs[i].state);
+            }
+            printf("%s", jobs[i].cmdline);
+        }
+    }
+}
+
+/******************************
+ * 信号处理函数
+********************************/
+handler_t *Signal(int signum, handler_t *handler) {
+    struct sigaction action, oldaction;
+
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = handler;
+    action.sa_flags = SA_RESTART;
+
+    if (sigaction(signum, &action, &oldaction) < 0) {
+        fprintf(stderr, "Signal error\n");
+        exit(1);
+    }
+    return (oldaction.sa_handler);
+}
+
+void sigchld_handler(int sig) {
+    sigset_t oldmask, mask;
+    pid_t pid;
+
+    sigfillset(&mask);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+    while ((pid = waitpid(0, NULL, 0)) > 0) {
+        deljob(pid);
+    }
+    sigprocmask(SIG_SETMASK, &oldmask, &mask);
 }
