@@ -54,6 +54,9 @@ struct pipecmd {
     struct cmd *right;
 };
 
+/**
+ * 管理重定向命令的结构体，type 一定为 REDIR
+ */
 struct redircmd {
     enum cmd_type type;
     int fgbg;
@@ -98,10 +101,27 @@ struct cmd *parsepipe(char *buf);
 struct cmd *parsecmd(char *cmd);
 void eval(char *cmdline, struct cmd *command);
 int is_built_in_command(struct cmd *command);
+struct cmd *create_pipecmd(struct cmd *left, struct cmd *right);
+struct cmd *create_execcmd(char *buf);
+struct cmd *create_redircmd(struct cmd *inner_command, int mode, char *in_file, char *out_file);
+void execredir(struct redircmd *redir_cmd);
+struct execcmd *getexeccmd(struct cmd *command);
 void test_parse(struct cmd *command);
+
+/*******************
+ * 作业相关函数
+*******************/
 void initjob();
 struct job_t *addjob(char *cmdline, int bgfg, struct cmd *command, pid_t pid);
 void listjobs();
+int maxjid();
+int deljob(pid_t pid);
+struct job_t *getjobjid(int jid);
+struct job_t *getjobpid(pid_t pid);
+
+/*******************
+ * 信号相关函数
+*******************/
 void sigchld_handler(int sig);
 void sigtstp_handler(int sig);
 void sigint_handler(int sig);
@@ -121,8 +141,11 @@ void print_prompt() {
 void readcmd(char *cmd) {
     char ch;
     int len = 0;
-    while ((ch = getchar()) != '\n') {
+    while ((ch = getchar()) != '\n' && ch != EOF) {
         cmd[len++] = ch;
+    }
+    if (len == 0) { // 到达文件末尾
+        exit(0);
     }
     cmd[len] = '\0';
 }
@@ -139,7 +162,7 @@ char *next_nonempty(char *buf) {
     return buf;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     static char cmdline[MAXLEN];
     // 通过 getenv 函数获得 PWD 环境变量
     // PWD 的值为启动时的作业目录
@@ -154,8 +177,23 @@ int main() {
     initjob();
     pid_t pid;
     sigset_t oldmask, mask;
+    int read_file = 0;  // 是否从文件中读入命令
+    int fd;             // 若从文件中读入命令，则 fd 保存打开的文件描述符
+    if (argc >= 2) {    // 从命令行传入文件，即从命令行读入命令
+        read_file = 1;
+        if ((fd = open(argv[1], O_RDONLY)) < 0) {   // 打开文件
+            fprintf(stderr, "open %s error: %s\n", argv[1], strerror(errno));
+            exit(1);
+        }
+        // 打开文件成功，将其重定向到标准输入上
+        close(0);   // 关闭标准输入
+        dup(fd);    // 重定向
+        close(fd);
+    }
     while (1) {
-        print_prompt();
+        if (!read_file) {   // 从标准输入读入
+            print_prompt();
+        }
         readcmd(cmdline);
         struct cmd *command = parsecmd(cmdline);
         if (!command) { // 空命令
@@ -378,6 +416,9 @@ struct cmd *parsepipe(char *buf) {
     return command;
 }
 
+/**
+ * execredir - 执行重定向命令
+ */
 void execredir(struct redircmd *redir_cmd) {
     int fd;
     struct execcmd *exec_cmd;
@@ -454,7 +495,7 @@ void eval(char *cmdline, struct cmd *command) {
 
             if (fork() == 0) {  //  right
                 close(0);
-                dup(fds[0]);
+                dup(fds[0]);    // 将管道复制到标准输入上
                 close(fds[0]);
                 close(fds[1]);
                 eval(cmdline, pipe_cmd->right);
@@ -462,7 +503,7 @@ void eval(char *cmdline, struct cmd *command) {
 
             if (fork() == 0) {    //  left
                 close(1);
-                dup(fds[1]);
+                dup(fds[1]);      // 将管道复制到标准输出上
                 close(fds[0]);
                 close(fds[1]);
                 eval(cmdline, pipe_cmd->left);
@@ -483,7 +524,8 @@ void eval(char *cmdline, struct cmd *command) {
 }
 
 /**
- * getexeccmd - 将 command 转化为 struct execcmd *
+ * getexeccmd - 将 command 转化为 struct execcmd *,
+ * 主要是应对 exec，exec 后运行的命令的类型不确定
  */
 struct execcmd *getexeccmd(struct cmd *command) {
     struct execcmd *exec_cmd;
@@ -574,9 +616,9 @@ void exec_imp(struct cmd *command) {
     int fd[2];
 
     switch (command->type) {
-        case EXEC:
+        case EXEC:  // 直接执行
             exec_cmd = (struct execcmd *)command;
-            if (strcmp(exec_cmd->argv[0], "exec") == 0) {
+            if (strcmp(exec_cmd->argv[0], "exec") == 0) {   // 若为 exec 命令，则需要将命令行参数向前移动一位
                 for (i = 0; i < exec_cmd->argc; i++) {
                     exec_cmd->argv[i] = exec_cmd->argv[i + 1];
                 }
@@ -590,7 +632,7 @@ void exec_imp(struct cmd *command) {
             }
             exit(0);
             break;
-        case PIPE:
+        case PIPE:  // 管道
             pipe_cmd = (struct pipecmd *)command;
             if (pipe(fd) == -1) {
                 fprintf(stderr, "pipe error: %s\n", strerror(errno));
@@ -598,7 +640,7 @@ void exec_imp(struct cmd *command) {
 
             if (fork() == 0) {  //  right
                 close(0);
-                dup(fd[0]);
+                dup(fd[0]);     // 将管道复制到标准输入上
                 close(fd[0]);
                 close(fd[1]);
                 exec_imp(pipe_cmd->right);
@@ -606,7 +648,7 @@ void exec_imp(struct cmd *command) {
 
             if (fork() == 0) {    //  left
                 close(1);
-                dup(fd[1]);
+                dup(fd[1]);       // 将管道复制到标准输出上
                 close(fd[0]);
                 close(fd[1]);
                 exec_imp(pipe_cmd->left);
@@ -618,8 +660,9 @@ void exec_imp(struct cmd *command) {
             wait(0);
             exit(0);
             break;
-        case REDIR:
+        case REDIR: // 重定向
             execredir((struct redircmd *)command);
+            break;
     }
 }
 
@@ -747,7 +790,7 @@ struct job_t *getjobjid(int jid) {
 /**
  * getjobpid - 通过 pid 获得结构体
  */
-struct job_t *getjobpid(int pid) {
+struct job_t *getjobpid(pid_t pid) {
     for (int i = 0; i < MAXJOBS; i++) {
         if (jobs[i].pid == pid) {
             return &jobs[i];
@@ -761,7 +804,7 @@ struct job_t *getjobpid(int pid) {
  * 参数传递
  */
 int fg_imp(int argc, char *argv[]) {
-    int jid = atoi(argv[1] + 1);
+    int jid;
     if (*argv[1] == '%') {
         jid = atoi(argv[1] + 1);
     } else {
@@ -779,7 +822,7 @@ int fg_imp(int argc, char *argv[]) {
     }
     fgpid = job->pid;
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    job->state = FG;
+    job->state = FG;        // 设置 job 的状态为 FG
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
     kill(-fgpid, SIGCONT);  // 传递 SIGCONT 信号，恢复运行
     return 0;
@@ -789,7 +832,7 @@ int fg_imp(int argc, char *argv[]) {
  * bg_imp - 将某一被暂停的作业转移到后台运行
  */
 int bg_imp(int argc, char *argv[]) {
-    int jid = atoi(argv[1] + 1);
+    int jid;
     if (*argv[1] == '%') {
         jid = atoi(argv[1] + 1);
     } else {
@@ -806,7 +849,7 @@ int bg_imp(int argc, char *argv[]) {
         return 1;
     }
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    job->state = BG;
+    job->state = BG;    // 设置 job 的状态为 BG
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
     kill(-fgpid, SIGCONT);  // 传递 SIGCONT 信号，恢复运行
     return 0;
@@ -870,6 +913,13 @@ handler_t *Signal(int signum, handler_t *handler) {
     return (oldaction.sa_handler);
 }
 
+/**
+ * sigchld_handler - 当子进程退出，或被停止，或被用户中断时，调用该函数，
+ * 该函数调用 waitpid 获得当前退出或停止的子进程的 pid，然后判断是否为当前的前台进程，
+ * 若是，则清空 fgpid；若不是，则判断当前进程退出的原因，若是被停止或中断，则输出
+ * 相关的信息
+ * 注意，我们要使用 while 循环，因为当这个函数被调用时，可能此时有多个子进程需要处理
+ */
 void sigchld_handler(int sig) {
     sigset_t oldmask, mask;
     pid_t pid;
@@ -878,10 +928,10 @@ void sigchld_handler(int sig) {
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
         sigfillset(&mask);
         sigprocmask(SIG_BLOCK, &mask, &oldmask);
-        if (fgpid == pid) {
+        if (fgpid == pid) {  // 当前的前台进程
             fgpid = 0;
         }
-        if (WIFEXITED(status)) {
+        if (WIFEXITED(status)) {          // 正常退出
             deljob(pid);
         } else if (WIFSTOPPED(status)) {  // SIGTSTP
             struct job_t *job = getjobpid(pid);
@@ -909,7 +959,7 @@ void sigint_handler(int sig) {
         return;
     }
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
-    kill(-fgpid, sig);
+    kill(-fgpid, sig);  // 向前台进程组传递信号
 }
 
 /**
@@ -926,5 +976,5 @@ void sigtstp_handler(int sig) {
         return;
     }
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
-    kill(-fgpid, sig);
+    kill(-fgpid, sig);  // 向前台进程组传递信号
 }
