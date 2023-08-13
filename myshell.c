@@ -144,7 +144,7 @@ void readcmd(char *cmd) {
     while ((ch = getchar()) != '\n' && ch != EOF) {
         cmd[len++] = ch;
     }
-    if (ch == EOF) { // 到达文件末尾
+    if (len == 0 && ch == EOF) { // 到达文件末尾
         exit(0);
     }
     cmd[len] = '\0';
@@ -851,7 +851,7 @@ int bg_imp(int argc, char *argv[]) {
     sigprocmask(SIG_BLOCK, &mask, NULL);
     job->state = BG;    // 设置 job 的状态为 BG
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
-    kill(-fgpid, SIGCONT);  // 传递 SIGCONT 信号，恢复运行
+    kill(-job->pid, SIGCONT);  // 传递 SIGCONT 信号，恢复运行
     return 0;
 }
 
