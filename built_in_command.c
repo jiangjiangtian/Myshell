@@ -142,6 +142,7 @@ void set_imp(void) {
 void umask_imp(char *argv[]) {
     if (argv[1] == NULL) {  // 没有参数，输出当前的设置
         printf("%u\n", mode);
+        return;
     }
     // 判断传入参数是否合法
     int len = strlen(argv[1]);
