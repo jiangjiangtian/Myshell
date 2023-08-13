@@ -50,7 +50,7 @@ do
 			$0 $1/${file##*/} $file 
 		fi
 	else
-		ls $1 | grep ${file##*/} > /dev/null 2>&1
+		ls $1 | grep -w ${file##*/} > /dev/null 2>&1
 		# 若在 $1 中找不到这个文件名，则将其删除
 		if [[ $? -ne 0 ]]
 		then
