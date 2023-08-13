@@ -139,12 +139,12 @@ void print_prompt() {
  * readcmd - 从标准输入读入命令，当遇到换行符时，停止读入
  */
 void readcmd(char *cmd) {
-    char ch;
+    char ch = '\0';
     int len = 0;
     while ((ch = getchar()) != '\n' && ch != EOF) {
         cmd[len++] = ch;
     }
-    if (len == 0) { // 到达文件末尾
+    if (ch == EOF) { // 到达文件末尾
         exit(0);
     }
     cmd[len] = '\0';
